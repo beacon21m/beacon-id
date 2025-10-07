@@ -1,0 +1,30 @@
+{
+  "name": "whatsapp-gateway",
+  "version": "0.1.0",
+  "description": "Minimal WhatsApp Web JS gateway client using Bun",
+  "private": true,
+  "scripts": {
+    "dev": "bun run src/start.ts",
+    "start": "bun run src/start.ts",
+    "npub-map": "bun run src/cli/npub-map.ts",
+    "start:all": "bun run src/start.ts",
+    "dev:all": "bun --watch src/start.ts",
+    "start:modular": "bun run src/start.ts",
+    "dev:modular": "bun --watch src/start.ts"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.7.1",
+    "@contextvm/sdk": "^0.1.29",
+    "@modelcontextprotocol/sdk": "^1.18.2",
+    "applesauce-core": "^4.0.0",
+    "applesauce-relay": "^4.0.0",
+    "applesauce-signers": "^4.0.0",
+    "applesauce-wallet-connect": "^4.0.0",
+    "light-bolt11-decoder": "^3.2.0",
+    "p-queue": "^8.0.1",
+    "puppeteer": "^23.3.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.24.0",
+    "zod": "^3.23.8"
+  }
+}
