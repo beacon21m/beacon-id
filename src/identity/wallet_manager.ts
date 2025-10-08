@@ -19,6 +19,14 @@ export interface PaymentResult {
 
 const pool = new RelayPool();
 
+function logWalletError(context: string, error: unknown, extra?: Record<string, unknown>) {
+  if (error instanceof Error) {
+    console.error(context, { message: error.message, stack: error.stack, ...extra });
+  } else {
+    console.error(context, { error, ...extra });
+  }
+}
+
 function getNwcUriForNpub(npub: string): string | null {
   const db = getDB();
   const row = db.query(`SELECT encrypted_nwc_string FROM user_wallets WHERE user_npub = ?`).get(npub) as any;
@@ -94,8 +102,8 @@ export async function makePayment(details: PendingPayment): Promise<PaymentResul
       return { success: false, error: 'Payment was rejected or failed.' };
     }
   } catch (error: any) {
-    console.error('[WalletManager] makePayment failed:', error);
-    return { success: false, error: error.message || 'An unknown error occurred.' };
+    logWalletError('[WalletManager] makePayment failed', error, { npub: details.npub, type: details.type });
+    return { success: false, error: error?.message || 'An unknown error occurred.' };
   }
 }
 
@@ -115,7 +123,8 @@ export async function getBalance(npub: string): Promise<BalanceResult> {
     const balanceSats = Math.floor(result.balance / 1000);
     return { success: true, balance: balanceSats };
   } catch (error: any) {
-    return { success: false, error: error.message || 'An unknown error occurred.' };
+    logWalletError('[WalletManager] getBalance failed', error, { npub });
+    return { success: false, error: error?.message || 'An unknown error occurred.' };
   }
 }
 export interface InvoiceResult {
@@ -137,7 +146,8 @@ export async function createInvoice(npub: string, amountSats: number): Promise<I
       return { success: false, error: 'Failed to create invoice.' };
     }
   } catch (error: any) {
-    return { success: false, error: error.message || 'An unknown error occurred.' };
+    logWalletError('[WalletManager] createInvoice failed', error, { npub, amountSats });
+    return { success: false, error: error?.message || 'An unknown error occurred.' };
   }
 }
 export interface LNAddressResult {
@@ -162,7 +172,8 @@ export async function getLNAddress(npub: string): Promise<LNAddressResult> {
       return { success: false, error: 'Lightning Address not found.' };
     }
   } catch (error: any) {
-    return { success: false, error: error.message || 'An unknown error occurred.' };
+    logWalletError('[WalletManager] getLNAddress failed', error, { npub });
+    return { success: false, error: error?.message || 'An unknown error occurred.' };
   }
 }
 export async function validateNwcString(nwcUri: string): Promise<boolean> {
@@ -175,7 +186,7 @@ export async function validateNwcString(nwcUri: string): Promise<boolean> {
     console.log(`[WalletManager] NWC URI is valid.`);
     return true;
   } catch (error) {
-    console.error('[WalletManager] NWC URI validation failed:', error);
+    logWalletError('[WalletManager] NWC URI validation failed', error, { nwcUri });
     return false;
   }
 }

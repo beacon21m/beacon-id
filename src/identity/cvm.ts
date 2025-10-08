@@ -48,6 +48,35 @@ function markRefIdAsProcessed(refId: string): void {
   setTimeout(() => processedRefIds.delete(refId), 5 * 60 * 1000); // 5 minute TTL
 }
 
+// --- Return Gateway Helper ---
+let cachedReturnGatewayId: string | null | undefined;
+function getReturnGatewayId(): string | null {
+  if (cachedReturnGatewayId !== undefined) return cachedReturnGatewayId;
+  const configured = (getEnv('GATEWAY_HEX_PUB', getEnv('ID_RETURN_GATEWAY_ID', '')) || '').trim();
+  if (!configured) {
+    console.warn('[CVM] return gateway ID not configured; Identity outbound messages may fail to dispatch.');
+    cachedReturnGatewayId = null;
+    return cachedReturnGatewayId;
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(configured)) {
+    console.error('[CVM] Invalid return gateway ID (expected 64-char hex). Value:', configured.slice(0, 8) + '…');
+    cachedReturnGatewayId = null;
+    return cachedReturnGatewayId;
+  }
+  cachedReturnGatewayId = configured;
+  return cachedReturnGatewayId;
+}
+
+function buildOutboundCtx(gateway: GatewayType, userId: string, overrideReturnGatewayId?: string): Record<string, unknown> {
+  const ctx: Record<string, unknown> = {
+    networkID: gateway,
+    userId,
+  };
+  const resolved = (overrideReturnGatewayId || '').trim() || getReturnGatewayId() || '';
+  if (resolved) ctx.returnGatewayID = resolved;
+  return ctx;
+}
+
 // --- DB Helpers ---
 function findGatewayUserByNpub(npub: string): string | null {
   try {
@@ -237,7 +266,7 @@ export async function startCvmServer() {
         to: targetUser,
         body: prompt,
         gateway: { type: targetGateway, npub: getEnv('GATEWAY_NPUB', '').trim() },
-        meta: { ctx: { networkID: targetGateway, userId: targetUser } }
+        meta: { ctx: buildOutboundCtx(targetGateway, targetUser) }
       });
       console.log(`[CVM] Enqueued approval prompt via ${targetGateway} to ${targetUser}`);
 
@@ -260,7 +289,7 @@ export async function startCvmServer() {
                 to: targetUser,
                 body: `(Auto) Payment successful! Receipt: ${result.receipt}`,
                 gateway: { type: targetGateway, npub: getEnv('GATEWAY_NPUB', '').trim() },
-                meta: { ctx: { networkID: targetGateway, userId: targetUser } }
+                meta: { ctx: buildOutboundCtx(targetGateway, targetUser) }
               });
               await sendPaymentConfirmation('paid', `Auto-approved payment. Receipt: ${result.receipt}`, stillPending);
               console.log('[CVM] Auto-approval completed: paid');
@@ -269,7 +298,7 @@ export async function startCvmServer() {
                 to: targetUser,
                 body: `(Auto) Payment failed: ${result.error}`,
                 gateway: { type: targetGateway, npub: getEnv('GATEWAY_NPUB', '').trim() },
-                meta: { ctx: { networkID: targetGateway, userId: targetUser } }
+                meta: { ctx: buildOutboundCtx(targetGateway, targetUser) }
               });
               await sendPaymentConfirmation('rejected', result.error || 'Auto-approved payment failed', stillPending);
               console.log('[CVM] Auto-approval completed: rejected');
@@ -331,7 +360,7 @@ export async function startCvmServer() {
         to: targetUser,
         body: prompt,
         gateway: { type: targetGateway, npub: getEnv('GATEWAY_NPUB', '').trim() },
-        meta: { ctx: { networkID: targetGateway, userId: targetUser } }
+        meta: { ctx: buildOutboundCtx(targetGateway, targetUser) }
       });
       console.log(`[CVM] Enqueued approval prompt via ${targetGateway} to ${targetUser}`);
 
@@ -570,7 +599,7 @@ export async function startCvmServer() {
           to: userId,
           body: message,
           gateway: { type: gatewayType, npub: getEnv('GATEWAY_NPUB', '').trim() },
-          meta: { ctx: { networkID: gatewayType, userId, ...(returnGatewayID ? { returnGatewayID } : {}) } },
+          meta: { ctx: buildOutboundCtx(gatewayType, userId, returnGatewayID) },
         });
         return { status: 'success', description: 'queued' } as const;
       } catch (err) {
