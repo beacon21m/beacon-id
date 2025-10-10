@@ -6,15 +6,38 @@ import { nip19 } from 'nostr-tools';
 import { consumeIdentityBeacon, enqueueIdentityOut } from './queues';
 import { retrieveAndClearConfirmation } from './pending_store';
 import { makePayment, validateNwcString } from './wallet_manager';
-import { getEnv, BeaconMessage } from '../types';
+import { getEnv, BeaconMessage, GatewayType } from '../types';
 import { sendPaymentConfirmation, notifyBrainOfNewUser } from './cvm';
 import { getDB } from '../db';
+import { upsertLocalNpubMap, rememberGatewayBotId, resolveUserLinks } from '../gateway/npubMap';
 import { encrypt } from './encryption';
 import { SimpleSigner } from 'applesauce-signers';
 import { toNpub } from 'applesauce-core/helpers/keys';
 
 // In-memory state to track onboarding conversations
 const onboardingState = new Map<string, { step: 'awaiting_nwc' | 'awaiting_ln_address', npub: string }>();
+
+function ensureBotId(
+  ctx: Record<string, unknown>,
+  gatewayType: GatewayType,
+  gatewayUser: string
+): string | undefined {
+  const existing = typeof ctx.botid === 'string' ? ctx.botid.trim() : '';
+  if (existing) return existing;
+  try {
+    const gatewayNpub = getEnv('GATEWAY_NPUB', '').trim();
+    if (!gatewayNpub) return undefined;
+    const links = resolveUserLinks(gatewayType, gatewayNpub, gatewayUser);
+    const stored = links?.gatewayBotId?.trim();
+    if (stored) {
+      ctx.botid = stored;
+      return stored;
+    }
+  } catch (err) {
+    console.error('[identity] ensureBotId error', err);
+  }
+  return undefined;
+}
 
 function isUserKnown(gatewayUser: string, gatewayType: string): boolean {
   try {
@@ -30,7 +53,7 @@ function isUserKnown(gatewayUser: string, gatewayType: string): boolean {
   }
 }
 
-async function createNewUser(gatewayType: string, gatewayUser: string): Promise<string | null> {
+async function createNewUser(gatewayType: GatewayType, gatewayUser: string, gatewayBotId?: string | null): Promise<string | null> {
   try {
     const db = getDB();
     // Correctly create a new signer and await the public key
@@ -40,11 +63,11 @@ async function createNewUser(gatewayType: string, gatewayUser: string): Promise<
     const npub = nip19.npubEncode(pubkey);
     
     const gatewayNpub = getEnv('GATEWAY_NPUB', '');
-    
-    db.query(
-      `INSERT INTO local_npub_map (gateway_type, gateway_npub, gateway_user, user_npub) VALUES (?, ?, ?, ?)`
-    ).run(gatewayType, gatewayNpub, gatewayUser, npub);
-    
+
+    upsertLocalNpubMap(gatewayType, gatewayNpub, gatewayUser, npub, {
+      gatewayBotId: gatewayBotId ? String(gatewayBotId) : null,
+    });
+
     console.log(`[identity] Created new user mapping for ${gatewayUser} -> ${npub}`);
     return npub;
   } catch (e) {
@@ -70,18 +93,20 @@ async function handleOnboarding(msg: BeaconMessage, messageText: string) {
   const gatewayUser = msg.source.from;
   console.log(`[identity] Starting onboarding for ${gatewayUser}`);
   const ctx = (msg.meta?.ctx || {}) as Record<string, unknown>;
+  let botIdFromCtx = ctx.botid ? String(ctx.botid) : undefined;
   const metaCtx = {
     networkID: msg.source.gateway.type,
     userId: gatewayUser,
     ...(ctx.returnGatewayID ? { returnGatewayID: String(ctx.returnGatewayID) } : {}),
-    ...(ctx.botid ? { botid: String(ctx.botid) } : {}),
+    ...(botIdFromCtx ? { botid: botIdFromCtx } : {}),
   };
+  botIdFromCtx = botIdFromCtx || ensureBotId(metaCtx, msg.source.gateway.type, gatewayUser);
 
   try {
     const state = onboardingState.get(gatewayUser);
 
     if (!state) { // Start of onboarding
-      const npub = await createNewUser(msg.source.gateway.type, gatewayUser);
+      const npub = await createNewUser(msg.source.gateway.type, gatewayUser, botIdFromCtx);
       if (!npub) {
         enqueueIdentityOut({ to: gatewayUser, body: "Sorry, there was an error creating your account. Please try again later.", gateway: msg.source.gateway, meta: { ctx: metaCtx } });
         return;
@@ -160,6 +185,16 @@ export function startIdentityWorker() {
       const messageText = (msg.source.text || '').trim();
       if (!messageText) return;
 
+      const ctx = (msg.meta?.ctx || {}) as Record<string, unknown>;
+      const botId = ctx.botid ? String(ctx.botid) : '';
+      if (botId) {
+        const gatewayInfo = msg.source.gateway;
+        const gatewayNpub = gatewayInfo?.npub || getEnv('GATEWAY_NPUB', '');
+        if (gatewayInfo?.type && gatewayNpub) {
+          rememberGatewayBotId(gatewayInfo.type, gatewayNpub, gatewayUser, botId);
+        }
+      }
+
       // --- Onboarding Flow ---
       if (!isUserKnown(gatewayUser, msg.source.gateway.type) || onboardingState.has(gatewayUser)) {
         await handleOnboarding(msg, messageText);
@@ -182,6 +217,7 @@ export function startIdentityWorker() {
             ...(ctx.returnGatewayID ? { returnGatewayID: String(ctx.returnGatewayID) } : {}),
             ...(ctx.botid ? { botid: String(ctx.botid) } : {}),
           };
+          ensureBotId(metaCtx, msg.source.gateway.type, gatewayUser);
           if (result.success) {
             const confirmationText = `Payment confirmed! Your receipt is: ${result.receipt}`;
             enqueueIdentityOut({ to: gatewayUser, body: confirmationText, gateway: msg.source.gateway, meta: { ctx: metaCtx } });

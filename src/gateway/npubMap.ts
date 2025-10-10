@@ -23,6 +23,7 @@ export interface UserLinkRecord {
   userNpub: string;
   beaconBrainNpub?: string;
   beaconIdNpub?: string;
+  gatewayBotId?: string;
 }
 
 /**
@@ -38,7 +39,7 @@ export function resolveUserLinks(
     const db = getDB();
     const row = db
       .query(
-        `SELECT user_npub, beacon_brain_npub, beacon_id_npub
+        `SELECT user_npub, beacon_brain_npub, beacon_id_npub, gateway_bot_id
          FROM local_npub_map
          WHERE gateway_type = ? AND gateway_npub = ? AND gateway_user = ?`
       )
@@ -48,6 +49,7 @@ export function resolveUserLinks(
       userNpub: row.user_npub,
       beaconBrainNpub: row.beacon_brain_npub || undefined,
       beaconIdNpub: row.beacon_id_npub || undefined,
+      gatewayBotId: row.gateway_bot_id || undefined,
     };
   } catch {
     return undefined;
@@ -81,17 +83,18 @@ export function upsertLocalNpubMap(
   gatewayNpub: string,
   gatewayUser: string,
   userNpub: string,
-  options?: { beaconBrainNpub?: string | null; beaconIdNpub?: string | null }
+  options?: { beaconBrainNpub?: string | null; beaconIdNpub?: string | null; gatewayBotId?: string | null }
 ): void {
   const db = getDB();
   const stmt = db.query(`
     INSERT INTO local_npub_map (
-      gateway_type, gateway_npub, gateway_user, user_npub, beacon_brain_npub, beacon_id_npub
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      gateway_type, gateway_npub, gateway_user, user_npub, beacon_brain_npub, beacon_id_npub, gateway_bot_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(gateway_type, gateway_npub, gateway_user) DO UPDATE SET
       user_npub = excluded.user_npub,
       beacon_brain_npub = COALESCE(excluded.beacon_brain_npub, local_npub_map.beacon_brain_npub),
-      beacon_id_npub = COALESCE(excluded.beacon_id_npub, local_npub_map.beacon_id_npub)
+      beacon_id_npub = COALESCE(excluded.beacon_id_npub, local_npub_map.beacon_id_npub),
+      gateway_bot_id = COALESCE(NULLIF(TRIM(excluded.gateway_bot_id), ''), local_npub_map.gateway_bot_id)
   `);
   stmt.run(
     gatewayType,
@@ -100,5 +103,30 @@ export function upsertLocalNpubMap(
     userNpub,
     options?.beaconBrainNpub ?? null,
     options?.beaconIdNpub ?? null,
+    options?.gatewayBotId ?? null,
   );
+}
+
+/**
+ * Persist a bot identifier for an existing gateway mapping when provided by upstream payloads.
+ */
+export function rememberGatewayBotId(
+  gatewayType: GatewayType,
+  gatewayNpub: string,
+  gatewayUser: string,
+  gatewayBotId: string | null | undefined
+): void {
+  const normalized = (gatewayBotId || '').trim();
+  if (!normalized) return;
+  const db = getDB();
+  db
+    .query(`
+      UPDATE local_npub_map
+        SET gateway_bot_id = ?
+        WHERE gateway_type = ?
+          AND gateway_npub = ?
+          AND gateway_user = ?
+          AND (gateway_bot_id IS NULL OR TRIM(gateway_bot_id) = '' OR gateway_bot_id != ?)
+    `)
+    .run(normalized, gatewayType, gatewayNpub, gatewayUser, normalized);
 }

@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ApplesauceRelayPool, NostrServerTransport, PrivateKeySigner } from '@contextvm/sdk';
 import { z } from 'zod';
 import { getEnv, toBeaconMessage, type GatewayType } from '../../types';
+import { rememberGatewayBotId } from '../../gateway/npubMap';
 import { getOutboundContext, forget } from '../beacon_store';
 import { enqueueBeacon } from '../../queues';
 import { recordInboundMessage, createOutboundMessage } from '../../db';
@@ -68,6 +69,7 @@ function normalizeWhatsAppJid(input: string): string | null {
         gatewayID: z.string().min(3),
         Npub: z.string().min(10),
         beacon_id_npub: z.string().min(10),
+        gateway_brain_botid: z.string().optional().default(''),
       },
     },
     async (args) => {
@@ -76,6 +78,7 @@ function normalizeWhatsAppJid(input: string): string | null {
         const gatewayIdRaw = String(args.gatewayID || '').trim();
         const userNpub = String(args.Npub || '').trim();
         const beaconIdNpub = String(args.beacon_id_npub || '').trim();
+        const gatewayBrainBotId = String(args.gateway_brain_botid || '').trim();
         if (!gatewayIdRaw) return { status: 'failure', description: 'invalid input: gatewayID required' };
         if (!userNpub) return { status: 'failure', description: 'invalid input: Npub required' };
         if (!beaconIdNpub) return { status: 'failure', description: 'invalid input: beacon_id_npub required' };
@@ -97,10 +100,25 @@ function normalizeWhatsAppJid(input: string): string | null {
         const db = getDB();
 
         const existingExact = db
-          .query(`SELECT user_npub FROM local_npub_map WHERE gateway_type = ? AND gateway_npub = ? AND gateway_user = ?`)
+          .query(`SELECT id, user_npub, gateway_bot_id FROM local_npub_map WHERE gateway_type = ? AND gateway_npub = ? AND gateway_user = ?`)
           .get(gatewayType, gatewayNpub, gatewayUser) as any;
 
         if (existingExact && existingExact.user_npub === userNpub) {
+          if (gatewayBrainBotId && (!existingExact.gateway_bot_id || !String(existingExact.gateway_bot_id).trim())) {
+            db
+              .query(`UPDATE local_npub_map SET gateway_bot_id = ? WHERE id = ?`)
+              .run(gatewayBrainBotId, existingExact.id);
+          }
+          if (gatewayBrainBotId) {
+            db
+              .query(`
+                UPDATE local_npub_map
+                  SET gateway_bot_id = ?
+                  WHERE user_npub = ?
+                    AND (gateway_bot_id IS NULL OR TRIM(gateway_bot_id) = '')
+              `)
+              .run(gatewayBrainBotId, userNpub);
+          }
           return { status: 'failure', description: 'preexisting user' };
         }
         if (existingExact && existingExact.user_npub !== userNpub) {
@@ -113,12 +131,19 @@ function normalizeWhatsAppJid(input: string): string | null {
 
         const insert = db.query(`
           INSERT INTO local_npub_map (
-            gateway_type, gateway_npub, gateway_user, user_npub, beacon_brain_npub, beacon_id_npub
-          ) VALUES (?, ?, ?, ?, NULL, ?)
+            gateway_type, gateway_npub, gateway_user, user_npub, beacon_brain_npub, beacon_id_npub, gateway_bot_id
+          ) VALUES (?, ?, ?, ?, NULL, ?, ?)
         `);
         let didInsert = false;
         try {
-          insert.run(gatewayType, gatewayNpub, gatewayUser, userNpub, beaconIdNpub);
+          insert.run(
+            gatewayType,
+            gatewayNpub,
+            gatewayUser,
+            userNpub,
+            beaconIdNpub || null,
+            gatewayBrainBotId || null,
+          );
           didInsert = true;
         } catch (e) {
           const nowExact = db
@@ -129,6 +154,22 @@ function normalizeWhatsAppJid(input: string): string | null {
           }
           return { status: 'failure', description: 'db error: unable to insert mapping' };
         }
+
+        if (gatewayBrainBotId) {
+          db
+            .query(`
+              UPDATE local_npub_map
+                SET gateway_bot_id = ?
+                WHERE user_npub = ?
+                  AND (gateway_bot_id IS NULL OR TRIM(gateway_bot_id) = '')
+            `)
+            .run(gatewayBrainBotId, userNpub);
+        }
+
+        const resolvedBotIdRow = db
+          .query(`SELECT gateway_bot_id FROM local_npub_map WHERE gateway_type = ? AND gateway_npub = ? AND gateway_user = ?`)
+          .get(gatewayType, gatewayNpub, gatewayUser) as any;
+        const resolvedBotId = String(resolvedBotIdRow?.gateway_bot_id || '').trim();
 
         // Send welcome message to the user for newly established mapping
         if (didInsert) {
@@ -143,7 +184,11 @@ function normalizeWhatsAppJid(input: string): string | null {
             role: 'beacon',
             userNpub,
             content: { text: welcome, to: gatewayUser, quotedMessageId: null },
-            metadata: { gateway: { type: gatewayType, npub: gatewayNpub }, source: 'cvm_onboard' },
+            metadata: {
+              gateway: { type: gatewayType, npub: gatewayNpub },
+              source: 'cvm_onboard',
+              ...(resolvedBotId ? { ctx: { botid: resolvedBotId } } : {}),
+            },
             channel: gatewayType,
           });
           enqueueOut({
@@ -153,6 +198,7 @@ function normalizeWhatsAppJid(input: string): string | null {
             deliveryId,
             messageId,
             gateway: { type: gatewayType as any, npub: gatewayNpub },
+            ...(resolvedBotId ? { meta: { ctx: { botid: resolvedBotId } } } : {}),
           });
         }
 
@@ -308,6 +354,10 @@ function normalizeWhatsAppJid(input: string): string | null {
           userId: normalizedUser,
           mapped: !!userNpub,
         });
+
+        if (userNpub && botid) {
+          rememberGatewayBotId(gatewayType, returnGatewayID, normalizedUser, botid);
+        }
 
         if (!userNpub) {
           // No mapping — build a BeaconMessage with a response and let the CVM dispatcher send it.

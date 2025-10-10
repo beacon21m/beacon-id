@@ -10,6 +10,7 @@ import { PendingPayment } from "./pending_store";
 import { enqueueIdentityOut, enqueueIdentityBeacon } from "./queues";
 import { storePendingConfirmation, retrieveAndClearConfirmation } from "./pending_store";
 import { getDB } from "../db";
+import { rememberGatewayBotId, resolveUserLinks } from "../gateway/npubMap";
 import { makePayment, getBalance, createInvoice, getLNAddress } from "./wallet_manager";
 import { nip19 } from 'nostr-tools';
 import { decode } from 'light-bolt11-decoder';
@@ -74,6 +75,18 @@ function buildOutboundCtx(gateway: GatewayType, userId: string, overrideReturnGa
   };
   const resolved = (overrideReturnGatewayId || '').trim() || getReturnGatewayId() || '';
   if (resolved) ctx.returnGatewayID = resolved;
+  if (!ctx.botid) {
+    try {
+      const gatewayNpub = getEnv('GATEWAY_NPUB', '').trim();
+      if (gatewayNpub) {
+        const links = resolveUserLinks(gateway, gatewayNpub, userId);
+        const stored = links?.gatewayBotId?.trim();
+        if (stored) ctx.botid = stored;
+      }
+    } catch (err) {
+      console.error('[CVM] buildOutboundCtx botid lookup failed', err);
+    }
+  }
   return ctx;
 }
 
@@ -156,6 +169,7 @@ export async function notifyBrainOfNewUser(params: {
   console.log(`[CVM Client] Notifying Brain of new user: ${params.npub}`);
   const privateKey = getEnv('IDENTITY_CVM_PRIVATE_KEY', '');
   const brainPubKey = getEnv('BRAIN_CVM_PUBLIC_KEY', '').trim();
+  const defaultGatewayBotId = getEnv('BRAIN_DEFAULT_ID', '').trim();
   if (!privateKey || !brainPubKey) {
     console.error('[CVM Client] FATAL: CVM keys for Identity (private) or Brain (public) are not set in .env.');
     return;
@@ -174,7 +188,7 @@ export async function notifyBrainOfNewUser(params: {
   try {
     await mcpClient.connect(clientTransport);
     console.log("[CVM Client] Connected to Brain CVM server for onboarding.");
-    const result = await mcpClient.callTool({
+    const toolArgs: Record<string, unknown> = {
       name: "onboardUser",
       arguments: {
         gatewayType: params.gatewayType,
@@ -182,7 +196,11 @@ export async function notifyBrainOfNewUser(params: {
         Npub: params.npub,
         beacon_id_npub: identityNpub,
       },
-    });
+    };
+    if (defaultGatewayBotId) {
+      (toolArgs.arguments as Record<string, unknown>).gateway_brain_botid = defaultGatewayBotId;
+    }
+    const result = await mcpClient.callTool(toolArgs);
     console.log("[CVM Client] Brain responded to onboardUser call:", result);
   } catch (error) {
     console.error("[CVM Client] Failed to notify Brain of new user:", error);
@@ -540,6 +558,10 @@ export async function startCvmServer() {
           userId: normalizedUser,
           mapped: !!userNpub,
         });
+
+        if (userNpub && botid) {
+          rememberGatewayBotId(gatewayType, returnGatewayID, normalizedUser, botid);
+        }
 
         const rawPayload = { refId, returnGatewayID, networkID, botid, botType, groupID, userId: userIdRaw, messageID, message };
         const beacon = toBeaconMessage(rawPayload, gateway, {

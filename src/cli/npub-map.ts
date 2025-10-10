@@ -20,6 +20,7 @@ async function main() {
   const userNpub = await prompt('User npub (canonical)');
   const beaconBrainNpub = await prompt('Beacon Brain npub (optional)');
   const beaconIdNpub = await prompt('Beacon ID npub (optional)');
+  const gatewayBotId = await prompt('Gateway bot id (optional)');
 
   if (!defaultGateway || !gatewayNpub || !gatewayUser || !userNpub) {
     console.error('All fields are required. Aborting.');
@@ -29,12 +30,13 @@ async function main() {
   const db = getDB();
   const stmt = db.query(`
     INSERT INTO local_npub_map (
-      gateway_type, gateway_npub, gateway_user, user_npub, beacon_brain_npub, beacon_id_npub
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      gateway_type, gateway_npub, gateway_user, user_npub, beacon_brain_npub, beacon_id_npub, gateway_bot_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(gateway_type, gateway_npub, gateway_user) DO UPDATE SET
       user_npub = excluded.user_npub,
       beacon_brain_npub = COALESCE(excluded.beacon_brain_npub, local_npub_map.beacon_brain_npub),
-      beacon_id_npub = COALESCE(excluded.beacon_id_npub, local_npub_map.beacon_id_npub)
+      beacon_id_npub = COALESCE(excluded.beacon_id_npub, local_npub_map.beacon_id_npub),
+      gateway_bot_id = COALESCE(NULLIF(TRIM(excluded.gateway_bot_id), ''), local_npub_map.gateway_bot_id)
   `);
   stmt.run(
     defaultGateway,
@@ -43,6 +45,7 @@ async function main() {
     userNpub,
     beaconBrainNpub?.trim() ? beaconBrainNpub.trim() : null,
     beaconIdNpub?.trim() ? beaconIdNpub.trim() : null,
+    gatewayBotId?.trim() ? gatewayBotId.trim() : null,
   );
   console.log('Mapping saved:', {
     gatewayType: defaultGateway,
@@ -51,6 +54,7 @@ async function main() {
     userNpub,
     beaconBrainNpub: beaconBrainNpub || undefined,
     beaconIdNpub: beaconIdNpub || undefined,
+    gatewayBotId: gatewayBotId || undefined,
   });
 }
 

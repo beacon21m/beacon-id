@@ -40,7 +40,27 @@ export function startBrainWorker() {
       if (mode !== 'cvm') return;
       // attach deliveryId into preserved ctx for dispatcher to update status
       msg.meta = msg.meta || {} as any;
-      (msg.meta as any).ctx = { ...((msg.meta as any).ctx || {}), deliveryId };
+      const existingCtx = ((msg.meta as any).ctx || {}) as Record<string, unknown>;
+      const mergedCtx: Record<string, unknown> = { ...existingCtx, deliveryId };
+
+      if (!mergedCtx.botid) {
+        const targetGateway = msg.response?.gateway || msg.source.gateway;
+        const targetUser = msg.response?.to || msg.source.from || '';
+        const gatewayType = targetGateway?.type;
+        const gatewayNpub = targetGateway?.npub || getEnv('GATEWAY_NPUB', '').trim();
+        if (gatewayType && gatewayNpub && targetUser) {
+          try {
+            const { resolveUserLinks } = await import('../gateway/npubMap');
+            const links = resolveUserLinks(gatewayType, gatewayNpub, targetUser);
+            const stored = links?.gatewayBotId?.trim();
+            if (stored) mergedCtx.botid = stored;
+          } catch (err) {
+            console.error('[brain] maybeReemitForCvm botid lookup error', err);
+          }
+        }
+      }
+
+      (msg.meta as any).ctx = mergedCtx;
       const { enqueueBeacon } = await import('../queues');
       enqueueBeacon(msg);
     } catch (err) {
