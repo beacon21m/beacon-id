@@ -5,17 +5,23 @@
 import { nip19 } from 'nostr-tools';
 import { consumeIdentityBeacon, enqueueIdentityOut } from './queues';
 import { retrieveAndClearConfirmation } from './pending_store';
-import { makePayment, validateNwcString } from './wallet_manager';
-import { getEnv, BeaconMessage, GatewayType } from '../types';
+import { makePayment, validateNwcString, getBalance } from './wallet_manager';
+import { getEnv, BeaconMessage, GatewayType, GatewayInfo } from '../types';
 import { sendPaymentConfirmation, notifyBrainOfNewUser } from './cvm';
 import { getDB } from '../db';
 import { upsertLocalNpubMap, rememberGatewayBotId, resolveUserLinks } from '../gateway/npubMap';
 import { encrypt } from './encryption';
 import { SimpleSigner } from 'applesauce-signers';
 import { toNpub } from 'applesauce-core/helpers/keys';
+import { createSubAccount } from './nwcli_client';
 
 // In-memory state to track onboarding conversations
-const onboardingState = new Map<string, { step: 'awaiting_nwc' | 'awaiting_ln_address', npub: string }>();
+type OnboardingStep =
+  | { step: 'awaiting_choice'; npub: string }
+  | { step: 'awaiting_nwc'; npub: string }
+  | { step: 'awaiting_ln_address'; npub: string };
+
+const onboardingState = new Map<string, OnboardingStep>();
 
 function ensureBotId(
   ctx: Record<string, unknown>,
@@ -76,16 +82,86 @@ async function createNewUser(gatewayType: GatewayType, gatewayUser: string, gate
   }
 }
 
-function saveWalletInfo(npub: string, nwcString: string, lnAddress?: string) {
+function saveNwcWallet(npub: string, nwcString: string, lnAddress?: string) {
   try {
     const db = getDB();
     const encrypted = encrypt(nwcString);
     db.query(
-      `INSERT INTO user_wallets (user_npub, encrypted_nwc_string, ln_address) VALUES (?, ?, ?)`
+      `INSERT INTO user_wallets (user_npub, wallet_type, encrypted_nwc_string, ln_address, api_identifier, api_subaccount_id, api_label)
+       VALUES (?, 'nwc', ?, ?, NULL, NULL, NULL)
+       ON CONFLICT(user_npub) DO UPDATE SET
+         wallet_type = 'nwc',
+         encrypted_nwc_string = excluded.encrypted_nwc_string,
+         ln_address = excluded.ln_address,
+         api_identifier = NULL,
+         api_subaccount_id = NULL,
+         api_label = NULL`
     ).run(npub, encrypted, lnAddress || null);
     console.log(`[identity] Saved wallet info for ${npub}`);
   } catch (e) {
-    console.error('[identity] saveWalletInfo DB error:', e);
+    console.error('[identity] saveNwcWallet DB error:', e);
+  }
+}
+
+function looksLikeNwcString(input: string): boolean {
+  return /^nostr\+walletconnect:\/\//i.test(input.trim());
+}
+
+function promptWalletChoice(params: { gatewayUser: string; gateway: GatewayInfo; metaCtx: Record<string, unknown> }) {
+  const message = [
+    'Welcome to Beacon!',
+    '',
+    'I am the Beacon ID. I help you manage your wallet and approvals. The Beacon Brain will answer your questions and help you work with your money and get access to any information you need.',
+    '',
+    'Would you like to:',
+    '(1) BYO Wallet w. Nostr Wallet Connect',
+    '(2) Generate a new wallet?',
+  ].join('\n');
+
+  enqueueIdentityOut({
+    to: params.gatewayUser,
+    body: message,
+    gateway: params.gateway,
+    meta: { ctx: params.metaCtx },
+  });
+}
+
+function parseWalletChoice(input: string): '1' | '2' | null {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === '1' || normalized.startsWith('1)') || normalized.includes('wallet connect') || normalized.includes('nwc')) {
+    return '1';
+  }
+  if (normalized === '2' || normalized.startsWith('2)') || normalized.includes('generate') || normalized.includes('new wallet')) {
+    return '2';
+  }
+  return null;
+}
+
+function generateSubAccountLabel(gatewayType: GatewayType, gatewayUser: string, npub: string): string {
+  const sanitizedUser = gatewayUser.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const suffix = (sanitizedUser.slice(-6) || npub.slice(-6)).toLowerCase();
+  const label = `beacon-${gatewayType}-${suffix}`;
+  return label.length > 32 ? label.slice(0, 32) : label;
+}
+
+function saveApiWallet(params: { npub: string; identifier: string; subAccountId: string; label: string }) {
+  try {
+    const db = getDB();
+    db.query(
+      `INSERT INTO user_wallets (user_npub, wallet_type, encrypted_nwc_string, ln_address, api_identifier, api_subaccount_id, api_label)
+       VALUES (?, 'api', NULL, NULL, ?, ?, ?)
+       ON CONFLICT(user_npub) DO UPDATE SET
+         wallet_type = 'api',
+         encrypted_nwc_string = NULL,
+         ln_address = NULL,
+         api_identifier = excluded.api_identifier,
+         api_subaccount_id = excluded.api_subaccount_id,
+         api_label = excluded.api_label`
+    ).run(params.npub, params.identifier, params.subAccountId, params.label);
+    console.log(`[identity] Saved API wallet info for ${params.npub}`);
+  } catch (e) {
+    console.error('[identity] saveApiWallet DB error:', e);
   }
 }
 
@@ -102,76 +178,155 @@ async function handleOnboarding(msg: BeaconMessage, messageText: string) {
   };
   botIdFromCtx = botIdFromCtx || ensureBotId(metaCtx, msg.source.gateway.type, gatewayUser);
 
+  const normalizedInput = messageText.trim();
+
+  async function finishOnboarding(npub: string) {
+    onboardingState.delete(gatewayUser);
+    await notifyBrainOfNewUser({
+      gatewayType: msg.source.gateway.type,
+      gatewayId: gatewayUser,
+      npub,
+    });
+    const completionMessage = [
+      "We've successfully created you a Lightning wallet and onboarded you to Bitcoin.",
+      '',
+      'The Beacon Brain will be in touch from another number. You can use the Brain to get access to any information and to ask for payments, invoices, etc from your wallet.',
+      '',
+      'No money can be spent by the Brain unless you approve it here first.',
+      '',
+      'We hope you have a great day!',
+    ].join('\n');
+    enqueueIdentityOut({
+      to: gatewayUser,
+      body: completionMessage,
+      gateway: msg.source.gateway,
+      meta: { ctx: metaCtx },
+    });
+    console.log(`[identity] Onboarding complete for ${gatewayUser}`);
+  }
+
+  async function handleGenerateWallet(state: OnboardingStep) {
+    const label = generateSubAccountLabel(msg.source.gateway.type, gatewayUser, state.npub);
+    try {
+      console.log(`[identity] Creating API wallet for ${gatewayUser} with label ${label}`);
+      const subAccount = await createSubAccount({
+        label,
+        description: `Beacon sub-account for ${msg.source.gateway.type}:${gatewayUser}`,
+        metadata: { gatewayType: msg.source.gateway.type, gatewayUser, npub: state.npub },
+      });
+      saveApiWallet({
+        npub: state.npub,
+        identifier: subAccount.identifier,
+        subAccountId: subAccount.id,
+        label: subAccount.subAccount.label,
+      });
+      await finishOnboarding(state.npub);
+    } catch (error) {
+      console.error('[identity] Failed to generate API wallet', { error, gatewayUser });
+      enqueueIdentityOut({
+        to: gatewayUser,
+        body: "Sorry, I couldn't create a wallet right now. Let's try that again.",
+        gateway: msg.source.gateway,
+        meta: { ctx: metaCtx },
+      });
+      onboardingState.set(gatewayUser, { step: 'awaiting_choice', npub: state.npub });
+      promptWalletChoice({ gatewayUser, gateway: msg.source.gateway, metaCtx });
+    }
+  }
+
+  async function handleNwcProvided(state: OnboardingStep, nwc: string) {
+    const isValid = await validateNwcString(nwc);
+    if (isValid) {
+      saveNwcWallet(state.npub, nwc);
+      onboardingState.set(gatewayUser, { step: 'awaiting_ln_address', npub: state.npub });
+      enqueueIdentityOut({
+        to: gatewayUser,
+        body: "That all worked, please can you tell me your lightning address for this wallet? Or if it's not available just say No",
+        gateway: msg.source.gateway,
+        meta: { ctx: metaCtx },
+      });
+      console.log(`[identity] Onboarding step 2: Awaiting LN Address for ${gatewayUser}`);
+    } else {
+      enqueueIdentityOut({
+        to: gatewayUser,
+        body: "Hey that didn't work, please ensure it's a valid wallet connect string or reply 2 to generate a new wallet.",
+        gateway: msg.source.gateway,
+        meta: { ctx: metaCtx },
+      });
+      console.log(`[identity] Invalid NWC string received from ${gatewayUser}`);
+    }
+  }
+
   try {
     const state = onboardingState.get(gatewayUser);
 
-    if (!state) { // Start of onboarding
+    if (!state) {
       const npub = await createNewUser(msg.source.gateway.type, gatewayUser, botIdFromCtx);
       if (!npub) {
-        enqueueIdentityOut({ to: gatewayUser, body: "Sorry, there was an error creating your account. Please try again later.", gateway: msg.source.gateway, meta: { ctx: metaCtx } });
+        enqueueIdentityOut({ to: gatewayUser, body: 'Sorry, there was an error creating your account. Please try again later.', gateway: msg.source.gateway, meta: { ctx: metaCtx } });
         return;
       }
-      onboardingState.set(gatewayUser, { step: 'awaiting_nwc', npub });
-      enqueueIdentityOut({
-        to: gatewayUser,
-        body: "Alright, lets setup your Bitcoin wallet, please respond with a nostr wallet connect string and I’ll do the rest.",
-        gateway: msg.source.gateway,
-        meta: { ctx: metaCtx }
-      });
-      console.log(`[identity] Onboarding step 1: Awaiting NWC for ${gatewayUser}`);
+      const initialState: OnboardingStep = { step: 'awaiting_choice', npub };
+      onboardingState.set(gatewayUser, initialState);
+      promptWalletChoice({ gatewayUser, gateway: msg.source.gateway, metaCtx });
+      console.log(`[identity] Onboarding step 0: Awaiting wallet preference for ${gatewayUser}`);
+      return;
+    }
+
+    if (state.step === 'awaiting_choice') {
+      if (looksLikeNwcString(normalizedInput)) {
+        await handleNwcProvided(state, normalizedInput);
+        return;
+      }
+      const choice = parseWalletChoice(normalizedInput);
+      if (choice === '1') {
+        onboardingState.set(gatewayUser, { step: 'awaiting_nwc', npub: state.npub });
+        enqueueIdentityOut({
+          to: gatewayUser,
+          body: "Alright, let's set up your Bitcoin wallet. Please respond with a nostr wallet connect string and I'll do the rest.",
+          gateway: msg.source.gateway,
+          meta: { ctx: metaCtx },
+        });
+        console.log(`[identity] Onboarding step 1: Awaiting NWC for ${gatewayUser}`);
+        return;
+      }
+      if (choice === '2') {
+        await handleGenerateWallet(state);
+        return;
+      }
+      promptWalletChoice({ gatewayUser, gateway: msg.source.gateway, metaCtx });
       return;
     }
 
     if (state.step === 'awaiting_nwc') {
-      const isValid = await validateNwcString(messageText);
-      if (isValid) {
-        saveWalletInfo(state.npub, messageText);
-        onboardingState.set(gatewayUser, { ...state, step: 'awaiting_ln_address' });
-        enqueueIdentityOut({
-          to: gatewayUser,
-          body: "That all worked, please can you tell me your lightning address for this wallet? Or if its not available just say No",
-          gateway: msg.source.gateway,
-          meta: { ctx: metaCtx }
-        });
-        console.log(`[identity] Onboarding step 2: Awaiting LN Address for ${gatewayUser}`);
-      } else {
-        enqueueIdentityOut({
-          to: gatewayUser,
-          body: "Hey that didn’t work, please ensure its just a valid wallet connect string",
-          gateway: msg.source.gateway,
-          meta: { ctx: metaCtx }
-        });
-        console.log(`[identity] Invalid NWC string received from ${gatewayUser}`);
+      if (looksLikeNwcString(normalizedInput)) {
+        await handleNwcProvided(state, normalizedInput);
+        return;
       }
+      const choice = parseWalletChoice(normalizedInput);
+      if (choice === '2') {
+        await handleGenerateWallet(state);
+        return;
+      }
+      enqueueIdentityOut({
+        to: gatewayUser,
+        body: "I'm still waiting on a valid wallet connect string. You can also reply 2 to generate a new wallet.",
+        gateway: msg.source.gateway,
+        meta: { ctx: metaCtx },
+      });
       return;
     }
 
     if (state.step === 'awaiting_ln_address') {
-      const lnAddress = messageText.toLowerCase() === 'no' ? null : messageText;
+      const lnAddress = normalizedInput.toLowerCase() === 'no' ? null : normalizedInput;
       getDB().query(`UPDATE user_wallets SET ln_address = ? WHERE user_npub = ?`).run(lnAddress, state.npub);
       console.log(`[identity] Updated LN Address for ${state.npub}`);
-      
-      onboardingState.delete(gatewayUser);
-      
-      // Notify the brain of the new user
-      await notifyBrainOfNewUser({
-        gatewayType: msg.source.gateway.type,
-        gatewayId: gatewayUser,
-        npub: state.npub,
-      });
-      
-      enqueueIdentityOut({
-        to: gatewayUser,
-        body: "We’ve setup your account and the Beacon Brain will be in touch.",
-        gateway: msg.source.gateway,
-        meta: { ctx: metaCtx }
-      });
-      console.log(`[identity] Onboarding complete for ${gatewayUser}`);
+      await finishOnboarding(state.npub);
       return;
     }
   } catch (e) {
     console.error('[identity] CRITICAL ERROR in handleOnboarding:', e);
-    enqueueIdentityOut({ to: gatewayUser, body: "Sorry, a critical error occurred during onboarding. Please start over.", gateway: msg.source.gateway, meta: { ctx: metaCtx } });
+    enqueueIdentityOut({ to: gatewayUser, body: 'Sorry, a critical error occurred during onboarding. Please start over.', gateway: msg.source.gateway, meta: { ctx: metaCtx } });
     onboardingState.delete(gatewayUser);
   }
 }
@@ -219,9 +374,23 @@ export function startIdentityWorker() {
           };
           ensureBotId(metaCtx, msg.source.gateway.type, gatewayUser);
           if (result.success) {
-            const confirmationText = `Payment confirmed! Your receipt is: ${result.receipt}`;
+            let confirmationText = 'Payment confirmed!';
+            if (result.receipt) {
+              confirmationText += ` Your receipt is: ${result.receipt}`;
+            }
+            try {
+              const balance = await getBalance(pendingPayment.npub);
+              if (balance.success && typeof balance.balance === 'number') {
+                confirmationText += ` Your new balance is ${balance.balance} sats.`;
+              }
+            } catch (balanceError) {
+              console.error('[identity] Failed to fetch balance after payment', balanceError);
+            }
             enqueueIdentityOut({ to: gatewayUser, body: confirmationText, gateway: msg.source.gateway, meta: { ctx: metaCtx } });
-            await sendPaymentConfirmation('paid', `Successful payment. Receipt: ${result.receipt}`, pendingPayment);
+            const confirmationSummary = result.receipt
+              ? `Successful payment. Receipt: ${result.receipt}`
+              : 'Successful payment.';
+            await sendPaymentConfirmation('paid', confirmationSummary, pendingPayment);
           } else {
             enqueueIdentityOut({ to: gatewayUser, body: `Payment failed: ${result.error}`, gateway: msg.source.gateway, meta: { ctx: metaCtx } });
             await sendPaymentConfirmation('rejected', result.error || 'Payment failed', pendingPayment);
